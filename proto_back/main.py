@@ -1,15 +1,29 @@
 """
-main.py — CogniFlow backend
-Compatible with Python 3.9+
+main.py — CogniFlow backend  (v3 — EAR + Head Pose)
+Python 3.9+ compatible
 
-Fixes applied
-─────────────────────────────────────────────────────────────────────
-BUG 1: engine.update_state called with 4 args, signature had 3  → fixed
-BUG 3: returned 3-tuple unpacked as 2                           → fixed
-BUG 4: Session_Data.csv never written → report always empty     → CSVLogger added
-BUG 5: recoveryLatency / eyePosition never sent to frontend     → added to payload
-BUG 7: CogniBot never imported or called                        → integrated
-PY39:  X | None syntax replaced with Optional[X] for Python 3.9 compatibility
+═══════════════════════════════════════════════════════════════════════
+WHAT'S NEW IN THIS VERSION
+═══════════════════════════════════════════════════════════════════════
+
+AIWorker now extracts THREE signals per frame instead of two:
+  1. Gaze (iris X/Y position)          ← was already present
+  2. EAR  (Eye Aspect Ratio)           ← NEW — drowsiness / fatigue
+  3. Head pitch (up/down tilt)         ← NEW — desk/phone looking
+
+CSVLogger now logs FIVE columns instead of four:
+  timestamp | focusScore | currentState | recoveryLatency
+  | earValue | headPitch           ← NEW — for quantitative evaluation
+
+WebSocket payload now includes SEVEN fields instead of six:
+  focusScore | currentState | recoveryLatency | eyePosition
+  | faceDetected | nudge
+  | earValue | blinkRate | headPitch | earStatus   ← NEW
+
+These additions directly address the paper's requirement for
+measurable, citable metrics (EAR is the most-cited metric in the
+drowsiness and attention literature).
+═══════════════════════════════════════════════════════════════════════
 """
 
 import csv
@@ -28,7 +42,7 @@ from fastapi.responses import StreamingResponse
 import mediapipe as mp
 import numpy as np
 
-from engine import AttentionEngine
+from engine import AttentionEngine, compute_avg_ear, compute_head_pitch
 from report_generator import ReportGenerator
 from chatbot import CogniBot
 
@@ -43,7 +57,7 @@ app.add_middleware(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CAMERA BUFFER — captures once, shares with all consumers
+# CAMERA BUFFER
 # ═══════════════════════════════════════════════════════════════════
 class CameraBuffer:
     def __init__(self, width: int = 320, height: int = 240):
@@ -51,8 +65,8 @@ class CameraBuffer:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, 25)
-        self._frame: Optional[np.ndarray] = None   # ← Python 3.9 compatible
-        self._lock = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+        self._lock  = threading.Lock()
         self._running = True
         threading.Thread(target=self._loop, daemon=True, name="CameraCapture").start()
 
@@ -64,7 +78,7 @@ class CameraBuffer:
                     self._frame = frame
             time.sleep(0.033)
 
-    def get_frame(self) -> Optional[np.ndarray]:           # ← Python 3.9 compatible
+    def get_frame(self) -> Optional[np.ndarray]:
         with self._lock:
             return self._frame.copy() if self._frame is not None else None
 
@@ -75,55 +89,98 @@ class CameraBuffer:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# AI WORKER — MediaPipe on its own dedicated thread
+# AI WORKER  (v3 — EAR + Head Pose added)
 # ═══════════════════════════════════════════════════════════════════
 class AIWorker:
     def __init__(self):
         self._in_q: queue.Queue = queue.Queue(maxsize=2)
         self._result: Dict[str, Any] = {
             "face_present": False,
-            "gaze_on": False,
-            "iris_x": 0.5,
-            "iris_y": 0.5,
+            "gaze_on":      False,
+            "iris_x":       0.5,
+            "iris_y":       0.5,
+            # ── NEW fields ────────────────────────────────────────────
+            "ear":          0.30,   # Eye Aspect Ratio (0.0–0.5 range)
+            "head_pitch":   0.0,    # Head tilt in degrees
         }
-        self._lock = threading.Lock()
+        self._lock    = threading.Lock()
         self._running = True
+        self._frame_count = 0
+
         threading.Thread(target=self._loop, daemon=True, name="AIWorker").start()
 
     def _loop(self):
         face_mesh = mp.solutions.face_mesh.FaceMesh(
-            refine_landmarks=True,
+            refine_landmarks=True,       # Required for iris landmarks (468+)
             max_num_faces=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_detection_confidence=0.65,
+            min_tracking_confidence=0.60,
         )
+
         while self._running:
             try:
                 frame: np.ndarray = self._in_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Frame skip — process every 2nd frame to save CPU
+            self._frame_count += 1
+            if self._frame_count % 2 != 0:
+                continue
+
+            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = face_mesh.process(rgb)
+
             face_present = bool(results.multi_face_landmarks)
-            gaze_on, iris_x, iris_y = False, 0.5, 0.5
+            gaze_on      = False
+            iris_x       = 0.5
+            iris_y       = 0.5
+            ear          = 0.30   # default to neutral (won't trigger drowsy)
+            head_pitch   = 0.0
+
             if face_present:
-                iris = results.multi_face_landmarks[0].landmark[468]
-                iris_x, iris_y = iris.x, iris.y
-                gaze_on = 0.30 < iris.x < 0.70
+                lm = results.multi_face_landmarks[0].landmark
+
+                # ── Iris / Gaze ────────────────────────────────────────
+                # Landmark 468 = right iris centre (requires refine_landmarks=True)
+                iris   = lm[468]
+                iris_x = iris.x
+                iris_y = iris.y
+
+                # Gaze zone: central 30% horizontally, central 50% vertically
+                # Tuned for a straight-ahead laptop webcam
+                gaze_on = (0.35 < iris_x < 0.65) and (0.25 < iris_y < 0.75)
+
+                # ── NEW: EAR calculation ───────────────────────────────
+                # compute_avg_ear() is imported from engine.py.
+                # It averages left and right eye EAR for robustness.
+                # Typical awake range: 0.25–0.35.
+                # Below 0.20 = eye closed. Below 0.22 for 2s = drowsy.
+                ear = compute_avg_ear(lm)
+
+                # ── NEW: Head Pose (Pitch) ─────────────────────────────
+                # compute_head_pitch() is imported from engine.py.
+                # Returns degrees: positive = looking down, negative = up.
+                # Thresholds in engine.py: down > 12°, up < -18°.
+                head_pitch = compute_head_pitch(lm)
+
             with self._lock:
                 self._result = {
                     "face_present": face_present,
-                    "gaze_on": gaze_on,
-                    "iris_x": iris_x,
-                    "iris_y": iris_y,
+                    "gaze_on":      gaze_on,
+                    "iris_x":       iris_x,
+                    "iris_y":       iris_y,
+                    "ear":          round(ear, 4),
+                    "head_pitch":   round(head_pitch, 2),
                 }
+
         face_mesh.close()
 
     def submit(self, frame: np.ndarray):
         try:
             self._in_q.put_nowait(frame)
         except queue.Full:
-            pass  # Drop stale frame — better than stalling on dual-core i5
+            pass
 
     def get_result(self) -> Dict[str, Any]:
         with self._lock:
@@ -134,36 +191,64 @@ class AIWorker:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CSV LOGGER
-# BUG 4 FIX: nothing ever wrote Session_Data.csv — report always
-#            returned "Error: No session data available".
+# CSV LOGGER  (v3 — EAR and head pitch columns added)
 # ═══════════════════════════════════════════════════════════════════
 class CSVLogger:
-    COLUMNS = ["timestamp", "focusScore", "currentState", "recoveryLatency"]
+    """
+    Writes one row per WebSocket tick to Session_Data.csv.
+
+    NEW COLUMNS vs v2:
+        earValue   — raw EAR reading for this tick (for quantitative analysis)
+        headPitch  — head pitch in degrees (for quantitative analysis)
+
+    These columns are what make quantitative evaluation possible.
+    You can load this CSV and compute:
+        - Mean EAR over session (alertness baseline)
+        - Time-series of EAR (drowsiness onset detection)
+        - Correlation between head pitch and focus score
+        - Blink rate per minute (blink count from EAR history)
+    """
+    COLUMNS = [
+        "timestamp",
+        "focusScore",
+        "currentState",
+        "recoveryLatency",
+        "earValue",       # NEW
+        "headPitch",      # NEW
+    ]
 
     def __init__(self, path: str = "Session_Data.csv"):
         self.path = path
         with open(self.path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=self.COLUMNS).writeheader()
 
-    def log(self, focus_score: float, state: str, frt: float):
+    def log(
+        self,
+        focus_score: float,
+        state:       str,
+        frt:         float,
+        ear:         float = 0.30,   # NEW
+        head_pitch:  float = 0.0,    # NEW
+    ):
         row = {
             "timestamp":       datetime.now().strftime("%H:%M:%S"),
             "focusScore":      round(focus_score, 2),
             "currentState":    state,
             "recoveryLatency": round(frt, 2),
+            "earValue":        round(ear, 4),    # NEW
+            "headPitch":       round(head_pitch, 2),  # NEW
         }
         with open(self.path, "a", newline="") as f:
             csv.DictWriter(f, fieldnames=self.COLUMNS).writerow(row)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Singletons — created once at startup
+# Singletons
 # ═══════════════════════════════════════════════════════════════════
 camera    = CameraBuffer()
 ai_worker = AIWorker()
 reporter  = ReportGenerator()
-bot       = CogniBot()   # BUG 7 FIX: was never instantiated in original
+bot       = CogniBot()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -198,7 +283,6 @@ async def cognitive_stream(websocket: WebSocket):
     await websocket.accept()
     session_active = True
 
-    # Per-session objects — safe for multiple concurrent sessions
     engine        = AttentionEngine()
     logger        = CSVLogger()
     last_state    = "Idle"
@@ -224,22 +308,30 @@ async def cognitive_stream(websocket: WebSocket):
 
             ai = ai_worker.get_result()
 
-            # BUG 1 + BUG 3 FIX:
-            # Before: state, score = engine.update_state(face, gaze, False, False)
-            #         → 4 args into 3-param function + 2-unpack of 3-tuple = two crashes
-            # After:  unpack all 3 values, pass phone_detected as keyword arg
+            # ── Call engine with ALL THREE signals ────────────────────
+            # Previously: engine.update_state(face_present, gaze_on_screen)
+            # Now:        engine.update_state(face_present, gaze_on_screen,
+            #                                 ear=..., head_pitch=...)
             state, score, reason = engine.update_state(
-                face_present=ai["face_present"],
-                gaze_on_screen=ai["gaze_on"],
-                phone_detected=False,
+                face_present   = ai["face_present"],
+                gaze_on_screen = ai["gaze_on"],
+                phone_detected = False,
+                ear            = ai["ear"],         # NEW
+                head_pitch     = ai["head_pitch"],  # NEW
             )
 
-            frt = engine.get_last_frt()
+            frt        = engine.get_last_frt()
+            blink_rate = engine.get_blink_rate()   # NEW
+            ear_status = engine.get_ear_status()   # NEW
 
-            # BUG 4 FIX: write one row to CSV every tick
-            logger.log(score, state, frt)
+            # ── Log to CSV with new columns ────────────────────────────
+            logger.log(
+                score, state, frt,
+                ear        = ai["ear"],         # NEW
+                head_pitch = ai["head_pitch"],  # NEW
+            )
 
-            # BUG 7 FIX: call CogniBot on state change only (not every tick)
+            # ── Nudge on state change ─────────────────────────────────
             if state != last_state:
                 last_state = state
                 try:
@@ -249,19 +341,27 @@ async def cognitive_stream(websocket: WebSocket):
                 except Exception:
                     current_nudge = "Stay focused — you've got this."
 
-            # BUG 5 FIX: send ALL fields the frontend expects
-            # Before: {"focusScore": score, "currentState": state}  ← missing 4 fields
-            # After:  full payload with recoveryLatency, eyePosition, faceDetected, nudge
+            # ── WebSocket payload (v3) ────────────────────────────────
+            # NEW fields: earValue, blinkRate, headPitch, earStatus
+            # These power the new EAR gauge and blink rate display in
+            # the frontend sidebar (CogniFlowSidebar.tsx v3).
             await websocket.send_json({
-                "focusScore":      round(score, 2),
+                # ── Existing fields (unchanged) ───────────────────────
+                "focusScore":      score,
                 "currentState":    state,
                 "recoveryLatency": frt,
                 "eyePosition":     {"x": ai["iris_x"], "y": ai["iris_y"]},
                 "faceDetected":    ai["face_present"],
+                "gazeOnScreen":    ai["gaze_on"],
                 "nudge":           current_nudge,
+                # ── NEW fields ────────────────────────────────────────
+                "earValue":        ai["ear"],          # 0.0–0.5, raw EAR
+                "blinkRate":       blink_rate,         # blinks per minute
+                "headPitch":       ai["head_pitch"],   # degrees
+                "earStatus":       ear_status,         # "Alert"/"Normal"/"Drowsy"/"Eyes Closed"
             })
 
-            await asyncio.sleep(0.1)   # 10 Hz data rate
+            await asyncio.sleep(0.125)   # 8 Hz
 
     except WebSocketDisconnect:
         pass
