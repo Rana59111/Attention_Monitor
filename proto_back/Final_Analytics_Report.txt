@@ -1,8 +1,8 @@
 --- COGNIFLOW SESSION SUMMARY ---
-Date: 2026-03-05 21:06
-Average Focus Score: 86.25%
+Date: 2026-03-06 10:54
+Average Focus Score: 85.97%
 Peak Focus Reached: 100.00%
-Avg Focus Recovery Time (FRT): 27.93 seconds
-Total Data Points: 1078
+Avg Focus Recovery Time (FRT): 19.41 seconds
+Total Data Points: 1152
 Result: High Productivity
 --------------------------------
